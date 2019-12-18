@@ -12,6 +12,7 @@ import (
 	"github.com/loadimpact/k6/lib/types"
 	"github.com/loadimpact/k6/stats"
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	null "gopkg.in/guregu/null.v3"
 )
@@ -269,7 +270,7 @@ func TestVariableArrivalRateRunCorrectRate(t *testing.T) {
 		currentCount = atomic.SwapInt64(&count, 0)
 		// this is highly dependant on minIntervalBetweenRateAdjustments
 		// TODO find out why this isn't 30 and fix it
-		require.InDelta(t, 23, currentCount, 2)
+		require.InDelta(t, 26, currentCount, 2)
 
 		time.Sleep(time.Second)
 		currentCount = atomic.SwapInt64(&count, 0)
@@ -279,5 +280,46 @@ func TestVariableArrivalRateRunCorrectRate(t *testing.T) {
 	err := executor.Run(ctx, engineOut)
 	wg.Wait()
 	require.NoError(t, err)
+	require.Empty(t, logHook.Drain())
+}
+
+func TestVariableArrivalRateRunCorrectRateWithSlowRate(t *testing.T) {
+	t.Parallel()
+	var count int64
+	var now = time.Now()
+	var expectedTimes = []time.Duration{
+		time.Millisecond * 2500, time.Second * 4, time.Millisecond * 5200}
+	var ctx, cancel, executor, logHook = setupExecutor(
+		t, VariableArrivalRateConfig{
+			TimeUnit: types.NullDurationFrom(time.Second),
+			Stages: []Stage{
+				{
+					Duration: types.NullDurationFrom(time.Second * 6),
+					Target:   null.IntFrom(1),
+				},
+			},
+			PreAllocatedVUs: null.IntFrom(10),
+			MaxVUs:          null.IntFrom(20),
+		},
+		simpleRunner(func(ctx context.Context) error {
+			current := atomic.AddInt64(&count, 1)
+			if !assert.True(t, int(current) <= len(expectedTimes)) {
+				return nil
+			}
+			expectedTime := expectedTimes[current-1]
+			assert.WithinDuration(t,
+				now.Add(expectedTime),
+				time.Now(),
+				time.Millisecond*100,
+				"%d expectedTime %s", current, expectedTime,
+			)
+			return nil
+		}),
+	)
+	defer cancel()
+	var engineOut = make(chan stats.SampleContainer, 1000)
+	err := executor.Run(ctx, engineOut)
+	require.NoError(t, err)
+	require.Equal(t, int64(3), count)
 	require.Empty(t, logHook.Drain())
 }

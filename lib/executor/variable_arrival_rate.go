@@ -314,10 +314,6 @@ func (varr VariableArrivalRate) Run(ctx context.Context, out chan<- stats.Sample
 
 	startTime, maxDurationCtx, regDurationCtx, cancel := getDurationContexts(ctx, duration, gracefulStop)
 	defer cancel()
-	ticker := &time.Ticker{}
-	if startTickerPeriod.Valid {
-		ticker = time.NewTicker(time.Duration(startTickerPeriod.Duration))
-	}
 
 	// Make sure the log and the progress bar have accurate information
 	varr.logger.WithFields(logrus.Fields{
@@ -379,33 +375,68 @@ func (varr VariableArrivalRate) Run(ctx context.Context, out chan<- stats.Sample
 	remainingUnplannedVUs := maxVUs - preAllocatedVUs
 	rateChangesStream := varr.streamRateChanges(maxDurationCtx, startTime)
 
+	startIteration := func() error {
+		select {
+		case vu := <-vus:
+			// ideally, we get the VU from the buffer without any issues
+			go runIteration(vu)
+		default:
+			if remainingUnplannedVUs == 0 {
+				//TODO: emit an error metric?
+				varr.logger.Warningf("Insufficient VUs, reached %d active VUs and cannot allocate more", maxVUs)
+				break
+			}
+			vu, err := varr.executionState.GetUnplannedVU(maxDurationCtx, varr.logger)
+			if err != nil {
+				return err
+			}
+			remainingUnplannedVUs--
+			atomic.AddUint64(&initialisedVUs, 1)
+			go runIteration(vu)
+		}
+		return nil
+	}
+
+	var now time.Time
+	var lastTick = time.Now()
+	var ticker = &time.Ticker{}
+	if startTickerPeriod.Valid {
+		ticker = time.NewTicker(time.Duration(atomic.LoadInt64(tickerPeriod)))
+	}
+	var ch <-chan time.Time
 	for {
 		select {
 		case rateChange := <-rateChangesStream:
-			newPeriod := rateChange.tickerPeriod
 			ticker.Stop()
-			if newPeriod.Valid {
-				ticker = time.NewTicker(time.Duration(newPeriod.Duration))
-			}
-			atomic.StoreInt64(tickerPeriod, int64(newPeriod.Duration))
-		case <-ticker.C:
 			select {
-			case vu := <-vus:
-				// ideally, we get the VU from the buffer without any issues
-				go runIteration(vu)
+			case <-ticker.C:
 			default:
-				if remainingUnplannedVUs == 0 {
-					//TODO: emit an error metric?
-					varr.logger.Warningf("Insufficient VUs, reached %d active VUs and cannot allocate more", maxVUs)
-					break
+			}
+			now = time.Now()
+			newPeriod := rateChange.tickerPeriod
+			atomic.StoreInt64(tickerPeriod, int64(newPeriod.Duration))
+			if newPeriod.Valid {
+				for lastTick.Before(now) {
+					nextIterationTime := time.Duration(newPeriod.Duration) - now.Sub(lastTick)
+					if nextIterationTime >= 0 {
+						ch = time.After(nextIterationTime)
+						break
+					}
+					lastTick = lastTick.Add(time.Duration(newPeriod.Duration))
+					if err := startIteration(); err != nil {
+						return err
+					}
 				}
-				vu, err := varr.executionState.GetUnplannedVU(maxDurationCtx, varr.logger)
-				if err != nil {
-					return err
-				}
-				remainingUnplannedVUs--
-				atomic.AddUint64(&initialisedVUs, 1)
-				go runIteration(vu)
+			}
+		case lastTick = <-ch:
+			ch = nil
+			if err := startIteration(); err != nil {
+				return err
+			}
+			ticker = time.NewTicker(time.Duration(atomic.LoadInt64(tickerPeriod)))
+		case lastTick = <-ticker.C:
+			if err := startIteration(); err != nil {
+				return err
 			}
 		case <-regDurationDone:
 			return nil
